@@ -23,6 +23,8 @@ class PyPardisoSolver:
     matrix type: real (float64) and nonsymetric
     methods: solve, factorize
 
+    - single precision: pass matrix A as float32, Pardiso then runs with iparm(28)=1 and returns x as float32
+
     - use the "solve(A,b)" method to solve Ax=b for x, where A is a sparse CSR (or CSC) matrix and b is a numpy array
     - use the "factorize(A)" method first, if you intend to solve the system more than once for different right-hand
       sides, the factorization will be reused automatically afterwards
@@ -170,7 +172,7 @@ class PyPardisoSolver:
             self.factorized_A = A.copy()
 
         self.set_phase(12)
-        b = np.zeros((A.shape[0], 1))
+        b = np.zeros((A.shape[0], 1), dtype=A.dtype)
         self._call_pardiso(A, b)
 
     def solve(self, A, b):
@@ -213,12 +215,15 @@ class PyPardisoSolver:
             return self._csr_matrix_equal(A, self.factorized_A)
 
     def _csr_matrix_equal(self, a1, a2):
-        return all((np.array_equal(a1.indptr, a2.indptr),
+        # np.array_equal ignores the dtype, but a factorization can't be reused for data of another dtype
+        return all((a1.dtype == a2.dtype,
+                    np.array_equal(a1.indptr, a2.indptr),
                     np.array_equal(a1.indices, a2.indices),
                     np.array_equal(a1.data, a2.data)))
 
     def _hash_csr_matrix(self, matrix):
-        return (hashlib.sha1(matrix.indices).hexdigest() +
+        return (str(matrix.dtype) +
+                hashlib.sha1(matrix.indices).hexdigest() +
                 hashlib.sha1(matrix.indptr).hexdigest() +
                 hashlib.sha1(matrix.data).hexdigest())
 
@@ -247,8 +252,9 @@ class PyPardisoSolver:
             row_col = 'column' if self._solve_transposed else 'row'
             raise ValueError('Matrix A is singular, because it contains empty {}(s)'.format(row_col))
 
-        if A.dtype != np.float64:
-            raise TypeError('PyPardiso currently only supports float64, but matrix A has dtype: {}'.format(A.dtype))
+        if A.dtype not in (np.float64, np.float32):
+            raise TypeError('PyPardiso supports float64 and float32 (single precision), but matrix A has dtype: '
+                            '{}'.format(A.dtype))
 
     def _check_b(self, A, b):
         if sp.issparse(b):
@@ -256,22 +262,53 @@ class PyPardisoSolver:
                           SparseEfficiencyWarning)
             b = b.todense()
 
+        if b.shape[0] != A.shape[0]:
+            raise ValueError("Dimension mismatch: Matrix A {} and array b {}".format(A.shape, b.shape))
+
+        # b (and x) must have the same dtype as A
+        if b.dtype != A.dtype:
+            if b.dtype in [np.float16, np.float32, np.float64, np.int16, np.int32, np.int64]:
+                # a float64 right-hand side (e.g. a residual) is cast to single precision silently if A is float32,
+                # every other conversion is reported (as before for float64 matrices)
+                if not (b.dtype == np.float64 and A.dtype == np.float32):
+                    msg = "Array b's data type was converted from {} to {}".format(str(b.dtype), str(A.dtype))
+                    warnings.warn(msg, PyPardisoWarning)
+                b = b.astype(A.dtype)
+            else:
+                raise TypeError('Dtype {} for array b is not supported'.format(str(b.dtype)))
+
         # pardiso expects fortran (column-major) order for b
         if not b.flags.f_contiguous:
             b = np.asfortranarray(b)
 
-        if b.shape[0] != A.shape[0]:
-            raise ValueError("Dimension mismatch: Matrix A {} and array b {}".format(A.shape, b.shape))
-
-        if b.dtype != np.float64:
-            if b.dtype in [np.float16, np.float32, np.int16, np.int32, np.int64]:
-                warnings.warn("Array b's data type was converted from {} to float64".format(str(b.dtype)),
-                              PyPardisoWarning)
-                b = b.astype(np.float64)
-            else:
-                raise TypeError('Dtype {} for array b is not supported'.format(str(b.dtype)))
-
         return b
+
+    def _set_precision(self, A):
+        """Select double (iparm(28)=0) or single (iparm(28)=1) precision from the dtype of A. Pardiso stores the
+        precision in its handle and accepts a change only in the analysis phase, therefore an existing handle of
+        the other precision is released first."""
+
+        single = int(A.dtype == np.float32)
+
+        if self.phase in (11, 12, 13):
+            if self.iparm[27] != single:
+                if self.pt.any():
+                    self._release_handle()
+                self.iparm[27] = single
+
+        elif self.phase > 0 and self.iparm[27] != single:
+            precision = 'single (float32)' if self.iparm[27] else 'double (float64)'
+            raise TypeError('The factorization is stored in {} precision, but matrix A has dtype {}. '
+                            'Factorize A again.'.format(precision, A.dtype))
+
+    def _release_handle(self):
+        """Release all of Pardiso's internal memory and reset the handle (pt)."""
+        phase = self.phase
+        self.phase = -1
+        self._call_pardiso(sp.csr_matrix((0, 0)), np.zeros(0))
+        self.phase = phase
+        self.pt[:] = 0
+        self.remove_stored_factorization()
 
     def _init_iparm(self):
         """Fill iparm with the default values of the current matrix type. A dummy handle is used, because
@@ -283,10 +320,12 @@ class PyPardisoSolver:
 
     def _call_pardiso(self, A, b):
 
+        self._set_precision(A)
+
         x = np.zeros_like(b)
         pardiso_error = ctypes.c_int32(0)
         c_int32_p = ctypes.POINTER(ctypes.c_int32)
-        c_float64_p = ctypes.POINTER(ctypes.c_double)
+        c_data_p = ctypes.c_void_p  # the data type of a, b and x is given by iparm(28)
 
         # 1-based indexing
         ia = A.indptr.astype(np.int32) + 1
@@ -298,15 +337,15 @@ class PyPardisoSolver:
                           ctypes.byref(ctypes.c_int32(self.mtype)),  # mtype -> 11 for real-nonsymetric
                           ctypes.byref(ctypes.c_int32(self.phase)),  # phase -> 13
                           ctypes.byref(ctypes.c_int32(A.shape[0])),  # N -> number of equations/size of matrix
-                          A.data.ctypes.data_as(c_float64_p),  # A -> non-zero entries in matrix
+                          A.data.ctypes.data_as(c_data_p),  # A -> non-zero entries in matrix
                           ia.ctypes.data_as(c_int32_p),  # ia -> csr-indptr
                           ja.ctypes.data_as(c_int32_p),  # ja -> csr-indices
                           self.perm.ctypes.data_as(c_int32_p),  # perm -> empty
                           ctypes.byref(ctypes.c_int32(1 if b.ndim == 1 else b.shape[1])),  # nrhs
                           self.iparm.ctypes.data_as(c_int32_p),  # iparm-array
                           ctypes.byref(ctypes.c_int32(self.msglvl)),  # msg-level -> 1: statistical info is printed
-                          b.ctypes.data_as(c_float64_p),  # b -> right-hand side vector/matrix
-                          x.ctypes.data_as(c_float64_p),  # x -> output
+                          b.ctypes.data_as(c_data_p),  # b -> right-hand side vector/matrix
+                          x.ctypes.data_as(c_data_p),  # x -> output
                           ctypes.byref(pardiso_error))  # pardiso error
 
         if pardiso_error.value != 0:
@@ -323,7 +362,8 @@ class PyPardisoSolver:
         return self.iparm[i-1]
 
     def set_iparm(self, i, value):
-        """set the i-th iparm to 'value' (1-based indexing)"""
+        """set the i-th iparm to 'value' (1-based indexing). The precision, iparm(28), is chosen automatically from
+        the dtype of matrix A (float64 or float32)."""
         if i not in {1, 2, 4, 5, 6, 8, 10, 11, 12, 13, 18, 19, 21, 24, 25, 27, 28, 31, 34, 35, 36, 37, 56, 60}:
             warnings.warn('{} is no input iparm. See the Pardiso documentation.'.format(value), PyPardisoWarning)
         self.iparm[i-1] = value

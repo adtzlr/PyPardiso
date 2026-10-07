@@ -43,3 +43,17 @@ Out[8]:
 array([ 0.02918389,  0.59629935,  0.33407289, -0.48788966,  3.44508841,
         0.52565687, -0.48420646,  0.22136413, -0.95464127,  0.58297397])
 ```
+
+## Single precision (float32)
+
+Pass the matrix `A` as `float32` to run PARDISO in single precision (`iparm(28)=1`). The factorization then needs about
+half the memory and is faster, the solution `x` is returned as `float32` (a `float64` right-hand side is cast silently).
+
+```python
+x = pypardiso.spsolve(A.astype(np.float32), b)
+```
+
+The accuracy of `x` is roughly `cond(A) * 1e-7`. Inside a Newton-Raphson loop with residuals evaluated in double
+precision this is usually sufficient (inexact Newton), for ill-conditioned systems (`cond(A) > 1e6`) it is not.
+Setting `iparm(8)` to a negative value (e.g. `-2`) accumulates the residuals of the iterative refinement in extended
+precision, which helps somewhat.
