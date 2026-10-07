@@ -170,7 +170,7 @@ class PyPardisoSolver:
             self.factorized_A = A.copy()
 
         self.set_phase(12)
-        b = np.zeros((A.shape[0], 1))
+        b = np.zeros((A.shape[0], 1), dtype=A.dtype)
         self._call_pardiso(A, b)
 
     def solve(self, A, b):
@@ -213,12 +213,15 @@ class PyPardisoSolver:
             return self._csr_matrix_equal(A, self.factorized_A)
 
     def _csr_matrix_equal(self, a1, a2):
-        return all((np.array_equal(a1.indptr, a2.indptr),
+        # np.array_equal ignores the dtype, but a factorization can't be reused for data of another dtype
+        return all((a1.dtype == a2.dtype,
+                    np.array_equal(a1.indptr, a2.indptr),
                     np.array_equal(a1.indices, a2.indices),
                     np.array_equal(a1.data, a2.data)))
 
     def _hash_csr_matrix(self, matrix):
-        return (hashlib.sha1(matrix.indices).hexdigest() +
+        return (str(matrix.dtype) +
+                hashlib.sha1(matrix.indices).hexdigest() +
                 hashlib.sha1(matrix.indptr).hexdigest() +
                 hashlib.sha1(matrix.data).hexdigest())
 
@@ -256,20 +259,21 @@ class PyPardisoSolver:
                           SparseEfficiencyWarning)
             b = b.todense()
 
-        # pardiso expects fortran (column-major) order for b
-        if not b.flags.f_contiguous:
-            b = np.asfortranarray(b)
-
         if b.shape[0] != A.shape[0]:
             raise ValueError("Dimension mismatch: Matrix A {} and array b {}".format(A.shape, b.shape))
 
-        if b.dtype != np.float64:
-            if b.dtype in [np.float16, np.float32, np.int16, np.int32, np.int64]:
-                warnings.warn("Array b's data type was converted from {} to float64".format(str(b.dtype)),
+        # b (and x) must have the same dtype as A
+        if b.dtype != A.dtype:
+            if b.dtype in [np.float16, np.float32, np.float64, np.int16, np.int32, np.int64]:
+                warnings.warn("Array b's data type was converted from {} to {}".format(str(b.dtype), str(A.dtype)),
                               PyPardisoWarning)
-                b = b.astype(np.float64)
+                b = b.astype(A.dtype)
             else:
                 raise TypeError('Dtype {} for array b is not supported'.format(str(b.dtype)))
+
+        # pardiso expects fortran (column-major) order for b
+        if not b.flags.f_contiguous:
+            b = np.asfortranarray(b)
 
         return b
 
@@ -286,7 +290,7 @@ class PyPardisoSolver:
         x = np.zeros_like(b)
         pardiso_error = ctypes.c_int32(0)
         c_int32_p = ctypes.POINTER(ctypes.c_int32)
-        c_float64_p = ctypes.POINTER(ctypes.c_double)
+        c_data_p = ctypes.c_void_p  # the data type of a, b and x is given by iparm(28)
 
         # 1-based indexing
         ia = A.indptr.astype(np.int32) + 1
@@ -298,15 +302,15 @@ class PyPardisoSolver:
                           ctypes.byref(ctypes.c_int32(self.mtype)),  # mtype -> 11 for real-nonsymetric
                           ctypes.byref(ctypes.c_int32(self.phase)),  # phase -> 13
                           ctypes.byref(ctypes.c_int32(A.shape[0])),  # N -> number of equations/size of matrix
-                          A.data.ctypes.data_as(c_float64_p),  # A -> non-zero entries in matrix
+                          A.data.ctypes.data_as(c_data_p),  # A -> non-zero entries in matrix
                           ia.ctypes.data_as(c_int32_p),  # ia -> csr-indptr
                           ja.ctypes.data_as(c_int32_p),  # ja -> csr-indices
                           self.perm.ctypes.data_as(c_int32_p),  # perm -> empty
                           ctypes.byref(ctypes.c_int32(1 if b.ndim == 1 else b.shape[1])),  # nrhs
                           self.iparm.ctypes.data_as(c_int32_p),  # iparm-array
                           ctypes.byref(ctypes.c_int32(self.msglvl)),  # msg-level -> 1: statistical info is printed
-                          b.ctypes.data_as(c_float64_p),  # b -> right-hand side vector/matrix
-                          x.ctypes.data_as(c_float64_p),  # x -> output
+                          b.ctypes.data_as(c_data_p),  # b -> right-hand side vector/matrix
+                          x.ctypes.data_as(c_data_p),  # x -> output
                           ctypes.byref(pardiso_error))  # pardiso error
 
         if pardiso_error.value != 0:
