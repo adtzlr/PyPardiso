@@ -130,6 +130,12 @@ class PyPardisoSolver:
 
         self._mkl_pardiso.restype = None
 
+        self._mkl_pardisoinit = self.libmkl.pardisoinit
+        self._mkl_pardisoinit.argtypes = [ctypes.POINTER(self._pt_type[0]),  # pt
+                                          ctypes.POINTER(ctypes.c_int32),    # mtype
+                                          ctypes.POINTER(ctypes.c_int32)]    # iparm
+        self._mkl_pardisoinit.restype = None
+
         self.pt = np.zeros(64, dtype=self._pt_type[1])
         self.iparm = np.zeros(64, dtype=np.int32)
         self.perm = np.zeros(0, dtype=np.int32)
@@ -137,6 +143,10 @@ class PyPardisoSolver:
         self.mtype = mtype
         self.phase = phase
         self.msglvl = False
+
+        # fill iparm with the MKL defaults for this matrix type (sets iparm[0]=1). With iparm[0]=0, MKL overwrites
+        # all iparms with defaults on the first call, so user settings would be ignored for that call.
+        self._init_iparm()
 
         self.factorized_A = sp.csr_matrix((0, 0))
         self.size_limit_storage = size_limit_storage
@@ -263,6 +273,14 @@ class PyPardisoSolver:
 
         return b
 
+    def _init_iparm(self):
+        """Fill iparm with the default values of the current matrix type. A dummy handle is used, because
+        pardisoinit() would reset the handle pt of an existing factorization."""
+        dummy_pt = np.zeros(64, dtype=self._pt_type[1])
+        self._mkl_pardisoinit(dummy_pt.ctypes.data_as(ctypes.POINTER(self._pt_type[0])),
+                              ctypes.byref(ctypes.c_int32(self.mtype)),
+                              self.iparm.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+
     def _call_pardiso(self, A, b):
 
         x = np.zeros_like(b)
@@ -311,8 +329,11 @@ class PyPardisoSolver:
         self.iparm[i-1] = value
 
     def set_matrix_type(self, mtype):
-        """Set the matrix type (see Pardiso documentation)"""
+        """Set the matrix type (see Pardiso documentation). This resets the iparms to the default values of the
+        new matrix type, call set_iparm afterwards."""
         self.mtype = mtype
+        self._init_iparm()
+        self.remove_stored_factorization()
 
     def set_statistical_info_on(self):
         """Display statistical info (appears in notebook server console window if pypardiso is
