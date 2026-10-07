@@ -13,6 +13,11 @@ import scipy.sparse as sp
 from scipy.sparse import SparseEfficiencyWarning
 
 
+# matrix types with symmetric storage (only the upper triangle): real symmetric positive definite (2), real symmetric
+# indefinite (-2), complex Hermitian positive definite (4), complex Hermitian indefinite (-4), complex symmetric (6)
+_SYMMETRIC_MTYPES = {2, -2, 4, -4, 6}
+
+
 class PyPardisoSolver:
     """
     Python interface to the Intel MKL PARDISO library for solving large sparse linear systems of equations Ax=b.
@@ -36,6 +41,8 @@ class PyPardisoSolver:
     - additional options can be accessed by setting the iparms (see Pardiso documentation for description)
     - other matrix types can be chosen with the "set_matrix_type" method. complex matrix types are currently not
       supported. pypardiso is only teste for mtype=11 (real and nonsymetric)
+    - for the symmetric matrix types (mtype=2 or -2), pass only the upper triangle of A as CSR matrix, e.g.
+      scipy.sparse.triu(A, format="csr"). Pardiso then needs about half the memory (LDL^T instead of LU)
     - the solving phases can be set with the "set_phase" method
     - The out-of-core (OOC) solver either fails or crashes my computer, be careful with iparm[60]
 
@@ -251,6 +258,19 @@ class PyPardisoSolver:
         if not np.diff(A.indptr).all():
             row_col = 'column' if self._solve_transposed else 'row'
             raise ValueError('Matrix A is singular, because it contains empty {}(s)'.format(row_col))
+
+        # for symmetric matrix types, pardiso expects only the upper triangle in CSR format. With entries below the
+        # diagonal, pardiso doesn't return (the matrix checker iparm(27)=1 gives error -1). The indices are sorted
+        # and no row is empty, so the first index of each row is its smallest column index.
+        if self.mtype in _SYMMETRIC_MTYPES:
+            if np.any(A.indices[A.indptr[:-1]] < np.arange(A.shape[0])):
+                if self._solve_transposed:
+                    hint = ('For a CSC matrix this is the lower triangle: use scipy.sparse.tril(A, format="csc"), '
+                            'or the upper triangle as CSR matrix.')
+                else:
+                    hint = 'Use scipy.sparse.triu(A, format="csr").'
+                raise ValueError('Pardiso uses only the upper triangle of A for the symmetric matrix type mtype={}, '
+                                 'but A has entries in the other triangle. {}'.format(self.mtype, hint))
 
         if A.dtype not in (np.float64, np.float32):
             raise TypeError('PyPardiso supports float64 and float32 (single precision), but matrix A has dtype: '

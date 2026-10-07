@@ -44,6 +44,21 @@ array([ 0.02918389,  0.59629935,  0.33407289, -0.48788966,  3.44508841,
         0.52565687, -0.48420646,  0.22136413, -0.95464127,  0.58297397])
 ```
 
+## Symmetric matrices
+
+For a symmetric matrix, PARDISO can use an LDLᵀ factorization instead of LU, which needs about half the memory. Choose
+a symmetric matrix type and pass **only the upper triangle** of `A` as CSR matrix:
+
+```python
+import scipy.sparse as sp
+
+solver = pypardiso.PyPardisoSolver(mtype=-2)  # real symmetric indefinite (mtype=2: positive definite)
+x = pypardiso.spsolve(sp.triu(A, format="csr"), b, solver=solver)
+```
+
+A matrix with entries below the diagonal raises a `ValueError` for these matrix types (PARDISO itself would not
+return). Note that `spsolve_triangular` is not a solver for symmetric matrices: it ignores the other triangle.
+
 ## Single precision (float32)
 
 Pass the matrix `A` as `float32` to run PARDISO in single precision (`iparm(28)=1`). The factorization then needs about
