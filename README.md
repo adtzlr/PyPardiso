@@ -57,3 +57,16 @@ The accuracy of `x` is roughly `cond(A) * 1e-7`. Inside a Newton-Raphson loop wi
 precision this is usually sufficient (inexact Newton), for ill-conditioned systems (`cond(A) > 1e6`) it is not.
 Setting `iparm(8)` to a negative value (e.g. `-2`) accumulates the residuals of the iterative refinement in extended
 precision, which helps somewhat.
+
+## Triangular systems
+
+`pypardiso.spsolve_triangular` mimics `scipy.sparse.linalg.spsolve_triangular`, but uses the triangular solver of the
+MKL Sparse BLAS (`mkl_sparse_?_trsv` / `mkl_sparse_?_trsm`) instead of SuperLU. PARDISO itself is not used.
+
+```python
+x = pypardiso.spsolve_triangular(L, b)               # L lower triangular (CSR or CSC)
+x = pypardiso.spsolve_triangular(U, b, lower=False)  # U upper triangular
+```
+
+Only the triangle given by `lower` is used, entries in the other triangle are ignored. `float32` and `float64` are
+supported, the dtype of `x` follows the same promotion rules as in SciPy.
